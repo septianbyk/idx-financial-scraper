@@ -19,16 +19,17 @@ For feature requests, explain the use case and how it would fit the project.
 
 1. Fork the repository and clone your fork:
 
-   git clone https://github.com/<your-username>/idx-financial-scraper.git
+   git clone https://github.com/<your-username>idx-financial-scraper.git
+
    cd idx-financial-scraper
 
-2. Create a virtual environment and install dependencies:
+3. Create a virtual environment and install dependencies:
 
    python -m venv .venv
    source .venv/bin/activate
    pip install -r requirements.txt
 
-3. Create a branch for your work:
+4. Create a branch for your work:
 
    git checkout -b feature/short-description
 
