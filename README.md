@@ -44,7 +44,7 @@ yfinance
 
 ## Usage
 
-Run the full pipeline from the `conten` directory:
+Run the full pipeline from the directory:
 
 ```bash
 python run.py
