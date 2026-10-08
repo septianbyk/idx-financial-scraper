@@ -33,10 +33,24 @@ PERIODS = [
 ]
 PERIOD_TAGS = [tag for _, tag in PERIODS]
 
+PDF_PERIOD_TOKEN = {
+    "Q1": "I",
+    "Q2": "II",
+    "Q3": "III",
+    "FY": "Tahunan",
+}
+
 IDX_URL_TEMPLATE = (
     "https://www.idx.co.id/Portals/0/StaticData/ListedCompanies/Corporate_Actions/"
     "New_Info_JSX/Jenis_Informasi/01_Laporan_Keuangan/02_Soft_Copy_Laporan_Keuangan/"
     "/Laporan%20Keuangan%20Tahun%20{year}/{period_folder}/{ticker}/instance.zip"
+)
+
+PDF_URL_TEMPLATE = (
+    "https://www.idx.co.id/Portals/0/StaticData/ListedCompanies/Corporate_Actions/"
+    "New_Info_JSX/Jenis_Informasi/01_Laporan_Keuangan/02_Soft_Copy_Laporan_Keuangan/"
+    "/Laporan%20Keuangan%20Tahun%20{year}/{period_folder}/{ticker}/"
+    "FinancialStatement-{year}-{token}-{ticker}.pdf"
 )
 
 CHROME_CANDIDATES = [
@@ -296,19 +310,97 @@ def bulk_download(
     )
 
 
+def bulk_download_pdf(
+    page,
+    tickers: list,
+    pdf_dir: Path,
+    failed_log_path: Path,
+    year: int,
+    period_folder: str,
+    period_tag: str,
+) -> None:
+    logger.info("Starting PDF download: year=%s period=%s tickers=%d", year, period_tag, len(tickers))
+
+    token = PDF_PERIOD_TOKEN[period_tag]
+    target_dir = pdf_dir / str(year) / period_tag
+    counts = {"saved": 0, "skipped_existing": 0, "not_found": 0, "blocked": 0, "http_error": 0, "errors": 0}
+
+    for index, ticker in enumerate(tickers, start=1):
+        target_file = target_dir / f"FinancialStatement-{year}-{token}-{ticker}.pdf"
+
+        if target_file.exists():
+            counts["skipped_existing"] += 1
+            continue
+
+        url = PDF_URL_TEMPLATE.format(year=year, period_folder=period_folder, ticker=ticker, token=token)
+        challenge_attempts = 0
+
+        while True:
+            try:
+                status, content = fetch_in_browser(page, url)
+            except Exception as e:
+                logger.error("Failed to download PDF %s: %s", ticker, e)
+                log_failed_download(failed_log_path, ticker, year, period_tag, f"pdf_{e}")
+                counts["errors"] += 1
+                break
+
+            is_pdf = content is not None and content[:4] == b"%PDF"
+
+            if status == 200 and is_pdf:
+                target_dir.mkdir(parents=True, exist_ok=True)
+                target_file.write_bytes(content)
+                logger.info("Saved PDF %s [%s %s]", ticker, period_tag, year)
+                counts["saved"] += 1
+                break
+
+            if status == 404:
+                logger.info("%s: PDF not found [%s %s]", ticker, period_tag, year)
+                counts["not_found"] += 1
+                break
+
+            if status in (403, 429) or status == 200:
+                if challenge_attempts >= MAX_CHALLENGE_RETRIES:
+                    logger.warning("%s: still blocked after %d verification attempts", ticker, challenge_attempts)
+                    log_failed_download(failed_log_path, ticker, year, period_tag, f"pdf_blocked_http_{status}")
+                    counts["blocked"] += 1
+                    raise BlockedError(f"Repeated blocking at {ticker} [{period_tag} {year}].")
+                logger.warning("%s: blocked (HTTP %s)", ticker, status)
+                wait_for_manual_challenge(page)
+                challenge_attempts += 1
+                continue
+
+            logger.warning("%s: unexpected HTTP %s", ticker, status)
+            log_failed_download(failed_log_path, ticker, year, period_tag, f"pdf_http_{status}")
+            counts["http_error"] += 1
+            break
+
+        if index % PROGRESS_EVERY == 0:
+            logger.info("Progress PDF %s %s: %d/%d tickers", period_tag, year, index, len(tickers))
+
+        time.sleep(REQUEST_DELAY_SECONDS)
+
+    logger.info(
+        "Finished PDF year=%s period=%s: %d saved, %d already on disk, %d not found (404), "
+        "%d blocked, %d other HTTP errors, %d errors",
+        year, period_tag, counts["saved"], counts["skipped_existing"], counts["not_found"],
+        counts["blocked"], counts["http_error"], counts["errors"],
+    )
+
+
 def parse_args() -> argparse.Namespace:
-    current_year = datetime.now().year
-    parser = argparse.ArgumentParser(description="Download IDX XBRL filings for a watchlist.")
+    parser = argparse.ArgumentParser(description="Download IDX XBRL filings or PDF financial statements for a watchlist.")
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR,
                         help="Base data directory (default: %(default)s)")
     parser.add_argument("--watchlist", type=Path, default=None,
                         help="CSV file with a 'ticker' column (default: <data-dir>/watchlist.csv)")
-    parser.add_argument("--start-year", type=int, default=2023)
-    parser.add_argument("--end-year", type=int, default=current_year)
+    parser.add_argument("--start-year", type=int, default=2022)
+    parser.add_argument("--end-year", type=int, default=2022)
     parser.add_argument("--tickers", nargs="+", default=None,
                         help="Optional subset of tickers, e.g. --tickers AALI ADRO")
     parser.add_argument("--periods", nargs="+", choices=PERIOD_TAGS, default=None,
                         help="Optional subset of periods, e.g. --periods Q1 FY")
+    parser.add_argument("--pdf", action="store_true",
+                        help="Download the PDF financial statement into <data-dir>/FinancialStatement instead of XBRL")
     parser.add_argument("--port", type=int, default=DEFAULT_DEBUG_PORT,
                         help="Chrome remote debugging port (default: %(default)s)")
     parser.add_argument("--chrome-path", type=str, default=None,
@@ -322,6 +414,7 @@ def main() -> None:
     data_dir = args.data_dir
     watchlist_path = args.watchlist or (data_dir / "watchlist.csv")
     xbrl_dir = data_dir / "XBRL"
+    pdf_dir = data_dir / "FinancialStatement"
     failed_log_path = data_dir / "failed_downloads.csv"
     profile_dir = data_dir / "chrome_profile"
 
@@ -353,10 +446,16 @@ def main() -> None:
 
             for year in range(args.start_year, args.end_year + 1):
                 for period_folder, period_tag in periods:
-                    bulk_download(
-                        page, tickers, xbrl_dir, failed_log_path,
-                        year, period_folder, period_tag,
-                    )
+                    if args.pdf:
+                        bulk_download_pdf(
+                            page, tickers, pdf_dir, failed_log_path,
+                            year, period_folder, period_tag,
+                        )
+                    else:
+                        bulk_download(
+                            page, tickers, xbrl_dir, failed_log_path,
+                            year, period_folder, period_tag,
+                        )
                     logger.info("Pausing before next period")
                     time.sleep(PERIOD_DELAY_SECONDS)
 
