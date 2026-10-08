@@ -19,6 +19,8 @@ MASTER_SCRIPT = "model/master-data.py"
 FETCH_SCRIPT = "model/fetch_idx.py"
 PARSE_SCRIPT = "model/arelle_loader.py"
 
+PERIOD_CHOICES = ["Q1", "Q2", "Q3", "FY"]
+
 
 def run_step(name: str, script: str, args: list) -> None:
     command = [sys.executable, str(SCRIPT_DIR / script), *args]
@@ -64,6 +66,12 @@ def parse_args() -> argparse.Namespace:
                         help="First year for download and parsing")
     parser.add_argument("--end-year", type=int, default=None,
                         help="Last year for download and parsing")
+    parser.add_argument("--tickers", nargs="+", default=None,
+                        help="Optional subset of tickers for the download step")
+    parser.add_argument("--periods", nargs="+", choices=PERIOD_CHOICES, default=None,
+                        help="Optional subset of periods for the download step")
+    parser.add_argument("--pdf", action="store_true",
+                        help="Only download PDF financial statements into <data-dir>/FinancialStatement")
     parser.add_argument("--skip-master", action="store_true", help="Skip the master data step")
     parser.add_argument("--skip-fetch", action="store_true", help="Skip the IDX download step")
     parser.add_argument("--skip-parse", action="store_true", help="Skip the XBRL parsing step")
@@ -72,6 +80,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+
+    if args.pdf:
+        args.skip_master = True
+        args.skip_parse = True
+        args.skip_fetch = False
+        logger.info("PDF mode: master data and XBRL parsing are skipped")
+
     watchlist_path = args.watchlist or (args.data_dir / "watchlist.csv")
 
     try:
@@ -89,11 +104,20 @@ def main() -> int:
     if args.end_year is not None:
         year_args += ["--end-year", str(args.end_year)]
 
+    fetch_extra_args = []
+    if args.tickers:
+        fetch_extra_args += ["--tickers", *args.tickers]
+    if args.periods:
+        fetch_extra_args += ["--periods", *args.periods]
+    if args.pdf:
+        fetch_extra_args.append("--pdf")
+
     steps = []
     if not args.skip_master:
         steps.append(("Master data", MASTER_SCRIPT, base_args + watchlist_args))
     if not args.skip_fetch:
-        steps.append(("IDX download", FETCH_SCRIPT, base_args + watchlist_args + year_args))
+        fetch_name = "IDX PDF download" if args.pdf else "IDX download"
+        steps.append((fetch_name, FETCH_SCRIPT, base_args + watchlist_args + year_args + fetch_extra_args))
     if not args.skip_parse:
         steps.append(("XBRL parsing", PARSE_SCRIPT, base_args + year_args))
 
@@ -114,7 +138,10 @@ def main() -> int:
         return 130
 
     logger.info("Pipeline finished in %.1f seconds", time.time() - started)
-    logger.info("Output: %s", args.data_dir / "financial_reports.csv")
+    if args.pdf:
+        logger.info("Output: %s", args.data_dir / "FinancialStatement")
+    else:
+        logger.info("Output: %s", args.data_dir / "financial_reports.csv")
     return 0
 
 
